@@ -78,7 +78,7 @@
 
 - `severity`
 - `fault_candidates`
-- `fault_confidence`
+- `fault_confidence` (폐기 예정)
 - `diagnosis_basis`
 - `trend_summary`
 - `waveform_summary`
@@ -141,6 +141,7 @@ Waveform 분석 단계에서는 다음 데이터가 생성된다.
 3. 결함 후보 순위는 Rule Engine 구조를 우선한다.
 4. 프론트는 Markdown 통짜 렌더링을 줄이고 구조 섹션 렌더링으로 전환한다.
 5. DB는 컬럼을 무리하게 늘리지 않고 JSON 확장을 우선한다.
+6. **하이브리드(Hybrid) 데이터 결합**: 정량적 분석 데이터(순위, 결함 유형, 점수 등)는 Rule Engine 결과를 담고 있는 `CHANNEL_RESULTS`에서 가져오고, LLM은 정성적인 서술(결론, 판단 배경, 조치 사항 등)만 작성하도록 하여 이 둘을 백엔드 조회 API 단에서 병합하여 제공한다.
 
 ---
 
@@ -177,14 +178,15 @@ Waveform 분석 단계에서는 다음 데이터가 생성된다.
 
 ```json
 {
-  "severity": "주의",
-  "fault_confidence": "MEDIUM",
+  "schema_version": 2,
+  "severity": "경고",
   "fault_candidates": ["MISALIGNMENT", "UNBALANCE"],
+  "fault_confidence": "HIGH", // API 응답에는 포함되나 프론트 화면에서는 표시하지 않음 (내부 참조용)
   "equipment_info": {
     "display_name": "Motor Train A",
     "measurement_location": "DE Horizontal",
     "measured_at": "2026-06-09T10:31:20+09:00",
-    "status_grade": "주의"
+    "status_grade": "경고"
   },
   "conclusion": {
     "title": "정렬 이상 가능성이 우선 검토됩니다.",
@@ -192,14 +194,19 @@ Waveform 분석 단계에서는 다음 데이터가 생성된다.
     "diagnosis_basis": "..."
   },
   "candidate_rankings": [
+    // 정상 판정 시 빈 배열([]) 허용
     {
       "rank": 1,
       "fault_type": "MISALIGNMENT",
       "title": "축 정렬 이상",
-      "decision_strength": "HIGH",
+      "decision_strength": "CONFIRMED", // CONFIRMED | LIKELY | PENDING
+      "score": 0.87,
       "reason": "2x 및 다중 조화성분 ...",
       "supporting_channels": ["DE Horizontal"],
-      "evidence_details": []
+      "evidence_summary": ["2x 진폭 증가"],
+      "evidence_details": [],
+      "recommended_checks": ["커플링 정렬 점검"],
+      "data_limitations": []
     }
   ],
   "action_plan": {
@@ -218,78 +225,138 @@ Waveform 분석 단계에서는 다음 데이터가 생성된다.
 }
 ```
 
-### 5.3.2 현실적 적용 방식
+### 5.3.2 하이브리드 조합 방식 (현실적 적용 및 일관성 보장)
 
-초기 적용은 아래처럼 두 단계로 나눈다.
+기존 DB 스키마 변경을 최소화하고 데이터 일관성을 100% 보장하기 위해 **하이브리드(Hybrid) 데이터 조합 방식**을 사용한다.
 
-1. DB 컬럼은 유지
-2. 새 구조 데이터는 `ORIGINAL_REPORT_JSON` 내부에 저장
-
-즉 기존 컬럼과 호환을 유지하면서도, 새 구조를 JSON에 담아 API 응답에서 활용한다.
+1. **DB 스키마 유지**: 테이블 구조는 변경하지 않는다.
+2. **LLM 서술 데이터 저장**: LLM은 정성적 서술 설명문(결론, 조치 계획, 결함별 판단 이유 등)만 생성하여 `TB_DIAGNOSIS_RESULT.ORIGINAL` (또는 `ORIGINAL_REPORT_JSON`)에 저장한다.
+3. **정량적 판정 데이터 추출**: 결함 후보 순위(rank), 결함 유형(fault_type), 점수(score), 판정 강도(decision_strength), 지지 채널, 세부 근거 등은 `TB_DIAGNOSIS_RUN.CHANNEL_RESULTS`에 저장된 Rule Engine 결과를 사용한다.
+4. **API 조회 시 결합**: 조회 API가 호출될 때, 백엔드는 `CHANNEL_RESULTS`의 Rule Engine 결과와 `ORIGINAL_REPORT_JSON`의 LLM 서술 데이터를 결합(Merge)하여 최종 응답 구조를 완성하여 반환한다.
 
 ## 5.4 Rule Engine 결과 활용 명세
 
 ### 5.4.1 핵심 원칙
 
-`결함 후보 순위 및 근거`는 LLM 자유 생성보다 Rule Engine 구조 결과를 우선 사용한다.
+`결함 후보 순위 및 근거`는 **Rule Engine이 단독으로 결정**한다. LLM은 판정 순위, 점수, 결함 유형, 판정 강도를 스스로 생성하거나 임의로 수정할 수 없다.
+
+백엔드 공급 필드 (Rule Engine 결과로부터 추출):
+- `rank`
+- `fault_type`
+- `score`
+- `decision_strength` (CONFIRMED / LIKELY / PENDING)
+- `supporting_channels`
+- `evidence_details`
+
+LLM 작성 필드 (정성적 서술 보강 전용):
+- `title` (사용자 친화적인 한국어 결함명)
+- `reason` (결함 판단 이유 설명 문장)
+- `evidence_summary` (주요 판정 근거 요약 문장 배열)
+- `recommended_checks` (권장 점검 항목 문장 배열)
+- `data_limitations` (데이터 제약 사항 또는 검토 제약 사항)
 
 원천 데이터:
-
 - `rule_engine_result.ranked_fault_candidates`
 - `rule_engine_result.diagnostic_decisions`
 
-### 5.4.2 API용 정규화 구조
+### 5.4.2 API용 정규화 구조 및 결합 방식
 
-`diagnostic_decisions`를 아래 구조로 정규화한다.
+백엔드는 Rule Engine 후보의 `fault_type` 리스트를 LLM에 전달하고, LLM은 각 `fault_type`에 대응되는 정성적 설명들을 `candidate_narratives` 객체 형태로 반환한다. 
+
+조회 API에서는 Rule Engine의 구조적 데이터와 LLM의 서술 데이터를 `fault_type`을 매핑 키로 하여 결합한다.
 
 ```json
+// 최종 candidate_rankings 원소 예시
 {
   "rank": 1,
   "fault_type": "MISALIGNMENT",
-  "title": "축 정렬 이상",
-  "decision_strength": "HIGH",
-  "score": 0.87,
-  "reason": "2x 성분과 관련 채널 지지가 확인됩니다.",
-  "supporting_channels": ["DE Horizontal", "NDE Horizontal"],
-  "evidence_summary": [
+  "title": "축 정렬 이상", // LLM 작성
+  "decision_strength": "CONFIRMED", // Rule Engine 판정
+  "score": 0.87, // Rule Engine 판정
+  "reason": "2x 성분과 관련 채널 지지가 확인됩니다.", // LLM 작성
+  "supporting_channels": ["DE Horizontal", "NDE Horizontal"], // Rule Engine 판정
+  "evidence_summary": [ // LLM 작성
     "2x 진폭 증가",
     "다중 조화성분 관찰"
   ],
-  "evidence_details": [],
-  "recommended_checks": [
+  "evidence_details": [], // Rule Engine 판정
+  "recommended_checks": [ // LLM 작성
     "커플링 정렬 점검",
     "베이스 체결 상태 점검"
   ],
-  "data_limitations": []
+  "data_limitations": [] // LLM 작성
 }
 ```
 
+필드별 생성 및 결합 규칙:
+
+| 필드 | 원천 소스 | 결합 로직 |
+|------|-----------|-----------|
+| rank | Rule Engine (`CHANNEL_RESULTS`) | 순위 매핑 |
+| fault_type | Rule Engine (`CHANNEL_RESULTS`) | 매핑용 Key로 사용 |
+| score | Rule Engine (`CHANNEL_RESULTS`) | 점수 매핑 |
+| decision_strength | Rule Engine (`CHANNEL_RESULTS`) | CONFIRMED / LIKELY / PENDING |
+| supporting_channels | Rule Engine (`CHANNEL_RESULTS`) | 지원 채널 리스트 매핑 |
+| evidence_details | Rule Engine (`CHANNEL_RESULTS`) | 세부 측정 피처 매핑 |
+| title | LLM (`ORIGINAL_REPORT_JSON`) | `candidate_narratives[fault_type].title`에서 매핑 |
+| reason | LLM (`ORIGINAL_REPORT_JSON`) | `candidate_narratives[fault_type].reason`에서 매핑 |
+| evidence_summary | LLM (`ORIGINAL_REPORT_JSON`) | `candidate_narratives[fault_type].evidence_summary`에서 매핑 |
+| recommended_checks | LLM (`ORIGINAL_REPORT_JSON`) | `candidate_narratives[fault_type].recommended_checks`에서 매핑 |
+| data_limitations | LLM (`ORIGINAL_REPORT_JSON`) | `candidate_narratives[fault_type].data_limitations`에서 매핑 |
+
 ### 5.4.3 구현 요구사항
 
-- `diagnostic_decisions`가 존재하면 이를 우선 사용
-- 없으면 `ranked_fault_candidates`를 fallback으로 사용
-- `fault_candidates`는 여전히 요약용 필드로 유지
-- `candidate_rankings`는 최종 보고서용 구조 필드로 추가
+- **매핑 폴백(Fallback)**: LLM이 특정 `fault_type`에 대한 서술을 누락했거나 매핑에 실패한 경우, 백엔드는 빈 값 또는 사전 정의된 기본 한국어 결함명(`title`)과 기본 문구를 매핑해 오류를 방지한다.
+- **정상 판정 시 예외 처리**: 정상/관찰 단계에서는 `candidate_rankings`를 빈 배열(`[]`)로 반환하는 것을 허용한다.
+- **이상 판정 시 최소 조건**: 경고/위험 단계에서는 Rule Engine이 최소 1개 이상의 후보를 생성하므로, `candidate_rankings`에 최소 1개 이상의 항목이 존재해야 한다.
+- **100% 일치 강제**: LLM은 판정 데이터에 관여하지 않으므로, 백엔드 병합 시 Rule Engine의 `rank/score/fault_type/decision_strength`를 반드시 원본 값 그대로 덮어써서 최종 응답을 완성한다.
 
-## 5.5 details / spectrum_snapshot 복원 명세
+## 5.5 details / spectrum_snapshot 복원 및 다중 채널 대응 명세
 
 ### 5.5.1 현재 문제
 
 Waveform 분석 시 `feature_details`와 `spectrum_snapshot`은 생성되지만, 현재 pipeline 조회 응답에서는 누락된다.
 
-### 5.5.2 수정 요구사항
+### 5.5.2 수정 및 채널 확장 요구사항 (Option A / B)
 
-조회 API 정규화 시 `CHANNEL_RESULTS.waveform_results`에서 대표 채널을 선택하고 아래처럼 매핑한다.
+향후 다중 채널(센서) 분석 시 데이터 손실을 막기 위해 아래의 두 가지 대안을 제안하며, 최종 프론트엔드 개편 수준에 맞추어 선택한다.
 
-- `primary_waveform.feature_details -> details`
-- `primary_waveform.spectrum_snapshot -> spectrum_snapshot`
-- `primary_waveform.dominant_peaks -> peaks`
-- `primary_waveform.rpm_value -> rpm_value`
-- `primary_waveform.fault_frequency_source -> fault_frequency_source`
+#### Option A (센서별 전체 채널 데이터 제공 - 권장)
+프론트엔드에서 여러 채널(예: VEL, ACC, ENV)을 탭이나 선택박스로 전환하며 조회할 수 있도록 전체 채널 분석 데이터를 제공한다.
+
+```json
+{
+  "waveform_channels": [
+    {
+      "point_id": 451002,
+      "measurement_id": 7,
+      "channel_type": "VEL",
+      "point_name": "DE Horizontal",
+      "status": "ANALYZED",
+      "details": [...],
+      "spectrum_snapshot": {...},
+      "dominant_peaks": [...]
+    }
+  ],
+  "primary_waveform_key": "451002/7",
+  "details": [...],            // 하위 호환용 (primary_waveform의 details)
+  "spectrum_snapshot": {...}    // 하위 호환용 (primary_waveform의 spectrum_snapshot)
+}
+```
+
+#### Option B (대표 채널 단일 제공 + 채널 정보 명시 - 현행 유지 및 보강)
+기존 화면 구조를 유지하기 위해 대표 채널 1개만 추출하여 매핑하되, 어떤 채널의 데이터인지 식별할 수 있도록 `primary_waveform_channel` 정보를 명시한다.
+
+- `primary_waveform_channel`: 대표 채널 명칭 (예: `"DE Horizontal (VEL)"`)
+- `primary_waveform.feature_details` -> `details`
+- `primary_waveform.spectrum_snapshot` -> `spectrum_snapshot`
+- `primary_waveform.dominant_peaks` -> `peaks`
+- `primary_waveform.rpm_value` -> `rpm_value`
+- `primary_waveform.fault_frequency_source` -> `fault_frequency_source`
 
 ### 5.5.3 대표 채널 선택 규칙
 
-우선순위:
+대표 채널을 선정할 때는 다음 우선순위에 따른다.
 
 1. run target과 일치하는 `point_id + measurement_id`
 2. 상태가 `ANALYZED`인 채널
@@ -343,24 +410,29 @@ Waveform 분석 시 `feature_details`와 `spectrum_snapshot`은 생성되지만,
 ### 5.8.1 유지 사항
 
 - `TB_DIAGNOSIS_RESULT` 기존 컬럼 유지
-- `TB_DIAGNOSIS_RUN.CHANNEL_RESULTS`는 raw analysis 저장 유지
+- `TB_DIAGNOSIS_RUN.CHANNEL_RESULTS`는 raw analysis 및 Rule Engine 판정 결과(`diagnostic_decisions` 등) 저장 유지
 
-### 5.8.2 추가 저장 사항
+### 5.8.2 추가 저장 사항 (하이브리드 기준)
 
-`ORIGINAL_REPORT_JSON`에 아래 구조 전체 저장:
+`ORIGINAL_REPORT_JSON`에 아래 구조 저장:
 
-- `equipment_info`
+- `schema_version` (값: 2, 신/구 데이터 구분용)
 - `conclusion`
-- `candidate_rankings`
+- `candidate_narratives` (결함 유형별 LLM 서술 딕셔너리)
 - `action_plan`
 - `data_summary`
 - `report_markdown`
+
+*참고: `equipment_info` 및 `candidate_rankings`의 구조적 항목(rank, score 등), `details`, `spectrum_snapshot`은 API 응답 구성 시 DB 컬럼과 `CHANNEL_RESULTS`에서 실시간 추출/조합하므로 `ORIGINAL_REPORT_JSON`에 중복 저장하지 않는다.*
+
+조회 시 `schema_version`이 없거나 1이면 기존 방식, 2 이상이면 새 하이브리드 결합 방식으로 분기한다.
 
 ### 5.8.3 이유
 
 - DB migration 비용을 줄일 수 있음
 - 보고서 스키마 변경에 유연함
-- FE/BE 개발 속도를 높일 수 있음
+- 중복 저장을 방지하여 데이터 일관성 100% 보장
+- `schema_version`으로 기존 데이터 마이그레이션 없이 신/구 구조 공존 가능
 
 ## 5.9 조회 API 수정 명세
 
@@ -380,33 +452,58 @@ Waveform 분석 시 `feature_details`와 `spectrum_snapshot`은 생성되지만,
 ### 5.9.2 응답 필드 요구사항
 
 - `ai_summary`는 하위 호환용으로 유지
-- 새 프론트는 `structured_report` 계열 필드를 우선 사용
+- 새 프론트는 구조화된 필드들을 우선 사용
 - `report_markdown`은 보조 렌더링/내보내기용으로 유지
+- `fault_confidence`는 API 응답 DTO에는 노출하되, 새 프론트 화면에서는 표시하지 않는다.
 
-## 5.10 검증 로직 수정 명세
+### 5.9.3 조회 경로 통일 및 공통 변환 로직
+
+모든 보고서 조회 API는 동일한 `_normalize_result()` 변환 함수를 거치도록 통일하여, 어느 경로로 조회하든 동일한 신구 대응 처리가 보장되도록 한다.
+
+적용 대상 API:
+- `GET /diagnosis/{id}`
+- `GET /diagnosis/run/{run_id}`
+- `GET /diagnosis/run/by-event/{event_id}`
+
+`_normalize_result()` 동작 상세:
+
+1. **신규 데이터 처리 (`schema_version` >= 2)**:
+   - `TB_DIAGNOSIS_RUN.CHANNEL_RESULTS`에서 Rule Engine의 판정 결과(`diagnostic_decisions`)를 읽는다.
+   - `ORIGINAL_REPORT_JSON`에서 `candidate_narratives`를 읽는다.
+   - `diagnostic_decisions`에 있는 각 후보별 `fault_type`을 매핑 키로 활용하여 `candidate_narratives`의 정성적 서술 항목(`title`, `reason`, `evidence_summary` 등)을 가져온다.
+   - 이 둘을 하나의 `candidate_rankings` 리스트로 결합한다. (정상/관찰 판정으로 Rule Engine 후보가 없을 시 빈 배열 `[]` 반환)
+   - 설비 정보 `equipment_info`와 waveform 데이터 `details`, `spectrum_snapshot`을 실시간 추출/바인딩한다.
+
+2. **기존 레거시 데이터 처리 (구 스키마 / `schema_version` < 2)**:
+   - `conclusion.summary`가 없을 경우 기존 `diagnosis_basis`나 `ai_summary`로 fallback 매핑한다.
+   - `action_plan.summary`가 없을 경우 기존 `recommended_action` 통문장을 그대로 매핑한다.
+   - `candidate_rankings`가 없을 경우 기존 `fault_candidates` 목록과 `severity`를 기준으로 기본적인 1회성 후보 리스트를 동적 생성하여 응답 구조를 일치시킨다.
+
+## 5.10 검증 로직 및 Fallback 수정 명세
+
+### 5.10.1 검증 로직 수정 명세
 
 `verify_report.py`는 새 구조를 기준으로 재정의한다.
 
 검증 항목:
-
 - `equipment_info` 필수 키 존재 여부
 - `conclusion.summary` 최소 길이
-- `candidate_rankings` 최대 3개, 최소 1개
+- `candidate_narratives` (또는 병합된 `candidate_rankings`) 최대 3개
+- **최소 조건**: severity가 "정상" 또는 "관찰"이면 `candidate_rankings` 빈 배열 `[]` 허용. "경고" 또는 "위험"이면 최소 1개 이상 존재 필수.
 - `action_plan.summary` 존재 여부
 - `data_summary.trend`, `data_summary.spectrum` 문자열 허용 여부
-- zone/severity 일관성 유지
+- zone/severity 일관성 유지 (현행 4단계: 정상/관찰/경고/위험)
 
 기존의 `report_markdown` 길이만 보는 방식은 보조 검증으로 격하한다.
 
-## 5.11 fallback 보고서 명세
+### 5.10.2 fallback 보고서 명세
 
 에러 시에도 새 템플릿 구조를 유지해야 한다.
 
 fallback 구조 원칙:
-
 - 설비 정보는 가능한 범위에서 채움
 - 결론은 `진단 보류` 또는 `데이터 부족` 명시
-- 후보 순위는 `진단 보류` 1건만 제공 가능
+- 후보 순위(`candidate_rankings`)는 설비 상태가 정상이면 빈 배열 `[]`, 이상 또는 분석 오류 시 `진단 보류` 1건(decision_strength: "PENDING")만 제공
 - 권장 조치는 재측정/데이터 확인 중심
 - 데이터 요약은 이용 가능 데이터 범위만 표시
 
@@ -483,7 +580,7 @@ fallback 구조 원칙:
 
 - 순위
 - 결함 후보
-- 판단 강도
+- 판정 강도 (확정/유력/보류)
 - 주요 근거
 - 지지 채널
 - 권장 점검
@@ -523,6 +620,8 @@ fallback 구조 원칙:
 - 항목
 - 값
 - 단위
+- 출처 (source)
+- 품질 (quality)
 - 설명
 
 ## 6.6 구현 방식 권장안
@@ -549,6 +648,38 @@ fallback 구조 원칙:
 - 필요 시 `action_plan.summary` 편집
 - Markdown 통짜 편집은 비권장
 
+## 6.8 재작성(Rewrite) 동작 정의
+
+재작성은 진단 분석을 다시 실행하지 않는다. 기존 판정을 유지하고 문장 표현만 재생성한다.
+
+### 6.8.1 변경 불가 필드
+
+다음 필드는 재작성 시 변경되지 않는다:
+
+- `severity`
+- `candidate_rankings[].rank`
+- `candidate_rankings[].fault_type`
+- `candidate_rankings[].score`
+- `candidate_rankings[].decision_strength`
+- `candidate_rankings[].evidence_details`
+- `candidate_rankings[].supporting_channels`
+- `details`, `spectrum_snapshot`
+- `data_limitations` (분석 기반 값)
+
+### 6.8.2 변경 가능 필드 (문장 재생성)
+
+- `conclusion.summary`, `conclusion.diagnosis_basis`
+- `candidate_rankings[].reason`, `evidence_summary`, `recommended_checks`, `data_limitations`
+- `action_plan.summary`, `immediate`, `short_term`, `long_term`
+- `report_markdown` (전체 재렌더링)
+
+### 6.8.3 기존 API 호환
+
+- `PATCH /diagnosis/{id}` → `conclusion.summary`만 직접 수정
+- `POST /diagnosis/{id}/rewrite` → 변경 가능 필드 전체 재생성
+- 재작성 시 원본 분석 데이터(`CHANNEL_RESULTS`)를 프롬프트에 재투입
+- 재작성 전후 severity/rank/score 일치 여부를 검증
+
 ---
 
 ## 7. 프롬프트 수정 초안
@@ -563,15 +694,13 @@ fallback 구조 원칙:
 반드시 아래 원칙을 지키세요.
 
 1. 단일 원인으로 억지 수렴하지 마세요.
-2. Rule Engine의 diagnostic_decisions를 우선 해석하세요.
-3. 결함 후보 순위는 diagnostic_decisions의 priority 순서를 따르세요.
-4. candidate_rankings의 각 항목은 수치 근거와 판단 이유를 분리해서 작성하세요.
-5. conclusion은 종합 결론만 작성하고, 후보별 상세 근거는 candidate_rankings에 작성하세요.
-6. action_plan은 점검 권고형 문구를 사용하세요.
-7. 데이터가 부족하면 추정 단정 대신 "진단 보류", "데이터 부족", "추가 확인 필요"를 사용하세요.
-8. measured_at, display_name, measurement_location, status_grade는 입력 구조 데이터를 우선 반영하세요.
-9. trend 요약과 spectrum 요약은 각각 1~3문장으로 간결하게 작성하세요.
-10. report_markdown은 최종 사용자에게 보여줄 한국어 보고서이며 아래 섹션 순서를 반드시 지키세요.
+2. Rule Engine의 진단 내용(결함 유형 등)을 바탕으로 해석을 제공하세요.
+3. LLM은 결함 유형별로 제목, 이유, 근거 요약, 권장 점검 항목, 데이터 제약 사항 등의 정성적인 서술(candidate_narratives)만 작성합니다. 결함 후보의 rank, score, decision_strength 등의 수치나 판정 강도는 백엔드가 확정하므로 LLM은 작성하지 않습니다.
+4. conclusion은 종합 결론만 작성하고, 후보별 상세 근거는 candidate_narratives에 작성하세요.
+5. action_plan은 점검 권고형 문구를 사용하세요.
+6. 데이터가 부족하면 추정 단정 대신 "진단 보류", "데이터 부족", "추가 확인 필요"를 사용하세요.
+7. trend 요약과 spectrum 요약은 각각 1~3문장으로 간결하게 작성하세요.
+8. report_markdown은 최종 사용자에게 보여줄 한국어 보고서이며 아래 섹션 순서를 반드시 지키세요.
 
 섹션 순서:
 1. 설비 정보
@@ -583,33 +712,27 @@ fallback 구조 원칙:
 반드시 아래 키만 사용하세요.
 
 {
-  "severity": "정상|관찰|주의|경고|위험",
-  "fault_confidence": "HIGH|MEDIUM|LOW",
-  "fault_candidates": ["후보1", "후보2", "후보3"],
-  "equipment_info": {
-    "display_name": "문자열",
-    "measurement_location": "문자열",
-    "measured_at": "ISO 날짜 문자열",
-    "status_grade": "문자열"
-  },
   "conclusion": {
     "title": "한 줄 결론",
     "summary": "종합 결론 설명",
     "diagnosis_basis": "판단 배경 설명"
   },
-  "candidate_rankings": [
-    {
-      "rank": 1,
-      "fault_type": "결함 코드 또는 이름",
-      "title": "사용자용 결함명",
-      "decision_strength": "HIGH|MEDIUM|LOW",
+  "candidate_narratives": {
+    "MISALIGNMENT": {
+      "title": "사용자용 한국어 결함명 (예: 축 정렬 이상)",
       "reason": "판단 이유",
-      "supporting_channels": ["채널1", "채널2"],
       "evidence_summary": ["근거1", "근거2"],
       "recommended_checks": ["점검1", "점검2"],
       "data_limitations": ["제약1"]
+    },
+    "UNBALANCE": {
+      "title": "사용자용 한국어 결함명 (예: 불평형)",
+      "reason": "판단 이유",
+      "evidence_summary": ["근거1"],
+      "recommended_checks": ["점검1"],
+      "data_limitations": []
     }
-  ],
+  },
   "action_plan": {
     "summary": "종합 조치 요약",
     "immediate": ["즉시 조치 1"],
@@ -632,17 +755,16 @@ report_markdown 바깥에는 Markdown을 쓰지 마세요.
 ### 7.1 프롬프트 운용 검토
 
 - 이 프롬프트는 단독 사용보다 서버 구조 보강과 함께 사용해야 한다.
-- `candidate_rankings`의 rank와 fault_type은 가능하면 백엔드에서 먼저 결정하고, LLM은 서술만 보강하는 방식이 더 안정적이다.
-- `equipment_info`는 가능하면 프롬프트 입력에 직접 넣고, LLM이 새로 추론하지 않게 해야 한다.
+- 백엔드는 Rule Engine이 판단한 결함 유형 목록(예: `["MISALIGNMENT", "UNBALANCE"]`)을 프롬프트 입력에 넣어주어, LLM이 `candidate_narratives`의 Key로 올바르게 사용하도록 유도한다.
+- LLM 응답 후 백엔드에서 `candidate_narratives`를 Rule Engine 원본 결과와 병합하여 최종 `candidate_rankings` 배열을 생성함으로써, LLM의 임의 판정 왜곡을 원천 차단한다.
 
----
+## 8. 최종 API 응답 JSON 예시 (하이브리드 결합 후 최종 DTO)
 
-## 8. 최종 API 응답 JSON 예시
-
-아래는 프론트가 최종적으로 소비하기 위한 권장 응답 예시다.
+아래는 백엔드가 Rule Engine 결과(`CHANNEL_RESULTS`)와 LLM 서술 결과(`ORIGINAL_REPORT_JSON`)를 결합하고, 대표 채널의 waveform 정보를 매핑하여 프론트엔드로 내보내는 최종 API 응답 예시다.
 
 ```json
 {
+  "schema_version": 2,
   "diagnosis_id": 1284,
   "run_id": 991,
   "sys1_id": "04",
@@ -651,20 +773,20 @@ report_markdown 바깥에는 Markdown을 쓰지 마세요.
   "point_id": 451002,
   "measurement_id": 7,
   "created_at": "2026-06-09T10:35:42+09:00",
-  "severity": "주의",
-  "severity_score": 3.0,
+  "severity": "경고",
+  "severity_score": 60,
   "fault_type": "MISALIGNMENT",
-  "fault_confidence": "MEDIUM",
   "fault_candidates": [
     "MISALIGNMENT",
     "UNBALANCE",
     "LOOSENESS"
   ],
+  "fault_confidence": "HIGH", // API 응답에는 유지하되 프론트 화면에는 표시하지 않음 (내부용)
   "equipment_info": {
     "display_name": "Motor Train A",
     "measurement_location": "DE Horizontal",
     "measured_at": "2026-06-09T10:31:20+09:00",
-    "status_grade": "주의"
+    "status_grade": "경고"
   },
   "conclusion": {
     "title": "축 정렬 이상 가능성이 우선 검토됩니다.",
@@ -676,7 +798,7 @@ report_markdown 바깥에는 Markdown을 쓰지 마세요.
       "rank": 1,
       "fault_type": "MISALIGNMENT",
       "title": "축 정렬 이상",
-      "decision_strength": "HIGH",
+      "decision_strength": "CONFIRMED",
       "score": 0.87,
       "reason": "2x 성분과 다중 조화성분이 함께 관찰되고, 복수 채널에서 유사한 패턴이 확인됩니다.",
       "supporting_channels": [
@@ -709,7 +831,7 @@ report_markdown 바깥에는 Markdown을 쓰지 마세요.
       "rank": 2,
       "fault_type": "UNBALANCE",
       "title": "불평형",
-      "decision_strength": "MEDIUM",
+      "decision_strength": "LIKELY",
       "score": 0.64,
       "reason": "1x 성분이 높으나 2x 성분 동반으로 인해 단독 불평형으로 단정하기는 어렵습니다.",
       "supporting_channels": [
@@ -730,7 +852,7 @@ report_markdown 바깥에는 Markdown을 쓰지 마세요.
       "rank": 3,
       "fault_type": "LOOSENESS",
       "title": "체결 느슨함",
-      "decision_strength": "LOW",
+      "decision_strength": "PENDING",
       "score": 0.41,
       "reason": "일부 조화성분 패턴이 있으나 지지 근거가 제한적입니다.",
       "supporting_channels": [
@@ -768,21 +890,27 @@ report_markdown 바깥에는 Markdown을 쓰지 마세요.
     "spectrum": "1x와 2x 성분이 함께 높게 나타나며 정렬 이상 가능성을 지지합니다.",
     "envelope": null
   },
+  "primary_waveform_channel": "DE Horizontal (VEL)", // Option B 적용 시 명시
   "details": [
     {
-      "feature_name": "1x_peak",
+      "feature_name": "1x_amplitude",
       "feature_value": 5.21,
       "feature_unit": "mm/s",
+      "source": "WAVEFORM_HARMONICS",
+      "quality": "OK",
       "description": "회전 1배 성분 진폭"
     },
     {
-      "feature_name": "2x_peak",
+      "feature_name": "2x_amplitude",
       "feature_value": 4.62,
       "feature_unit": "mm/s",
+      "source": "WAVEFORM_HARMONICS",
+      "quality": "OK",
       "description": "회전 2배 성분 진폭"
     }
   ],
   "spectrum_snapshot": {
+    "zone1_subharmonic": null,
     "zone2_harmonics": {
       "one_x": {
         "actual_freq_hz": 29.4,
@@ -792,7 +920,9 @@ report_markdown 바깥에는 Markdown을 쓰지 마세요.
         "actual_freq_hz": 58.8,
         "amplitude": 4.62
       }
-    }
+    },
+    "zone3_high_freq": null,
+    "runup_coastdown": null
   },
   "data_limitations": [
     "일부 후보는 중첩 가능성이 있습니다."
@@ -818,7 +948,7 @@ report_markdown 바깥에는 Markdown을 쓰지 마세요.
 - `details` 복원
 - `spectrum_snapshot` 복원
 - `diagnostic_decisions` 응답 노출
-- `fault_confidence` 타입 정합성 정리
+- 조회 API 3개 경로에 동일 변환 로직 적용
 
 효과:
 
@@ -865,8 +995,9 @@ report_markdown 바깥에는 Markdown을 쓰지 마세요.
 ### 10.2 반드시 반영해야 할 항목
 
 - `details` / `spectrum_snapshot` 복원
-- `diagnostic_decisions` 기반 후보 순위 구조화
-- `fault_confidence` 타입 정리
+- `diagnostic_decisions` 기반 후보 순위 구조화 (Rule Engine 전담, LLM 서술 전용)
+- 재작성 범위 제한 적용
+- `schema_version` 도입으로 신/구 데이터 공존
 - 새 템플릿 기반 응답 필드 추가
 
 ### 10.3 과도하게 하지 말아야 할 항목
